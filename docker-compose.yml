@@ -1,0 +1,345 @@
+version: '3.8'
+
+services:
+  # ===================================
+  # DATABASE - MySQL
+  # ===================================
+  mysql:
+    image: mysql:8.0
+    container_name: evl_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-english_video_learning}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - evl_network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===================================
+  # CACHE & MESSAGE BROKER - Redis
+  # ===================================
+  redis:
+    image: redis:7-alpine
+    container_name: evl_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - evl_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ===================================
+  # MESSAGE QUEUE - RabbitMQ
+  # ===================================
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: evl_rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - evl_network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ===================================
+  # OBJECT STORAGE - MinIO (S3-compatible)
+  # ===================================
+  minio:
+    image: minio/minio:latest
+    container_name: evl_minio
+    restart: always
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console UI
+    volumes:
+      - minio_data:/data
+    networks:
+      - evl_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: evl_minio_init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/videos --ignore-existing;
+      /usr/bin/mc mb myminio/subtitles --ignore-existing;
+      /usr/bin/mc mb myminio/thumbnails --ignore-existing;
+      /usr/bin/mc mb myminio/audio --ignore-existing;
+      /usr/bin/mc mb myminio/clips --ignore-existing;
+      /usr/bin/mc anonymous set download myminio/videos;
+      /usr/bin/mc anonymous set download myminio/thumbnails;
+      /usr/bin/mc anonymous set download myminio/clips;
+      exit 0;
+      "
+    networks:
+      - evl_network
+
+  # ===================================
+  # SEARCH ENGINE - Elasticsearch
+  # ===================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: evl_elasticsearch
+    restart: always
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - evl_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ===================================
+  # BACKEND API - FastAPI
+  # ===================================
+  backend-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: evl_backend_api
+    restart: always
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - ELASTICSEARCH_URL=${ELASTICSEARCH_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - evl_network
+
+  # ===================================
+  # CELERY WORKER - Background Tasks
+  # ===================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: evl_celery_worker
+    restart: always
+    command: celery -A workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - WHISPERX_API_URL=${WHISPERX_API_URL}
+      - SEMANTIC_CHUNKER_URL=${SEMANTIC_CHUNKER_URL}
+      - SMART_CLIPPER_URL=${SMART_CLIPPER_URL}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ELASTICSEARCH_URL=${ELASTICSEARCH_URL}
+    volumes:
+      - ./backend:/app
+      - /tmp/video-processing:/tmp/video-processing
+    depends_on:
+      - redis
+      - rabbitmq
+      - mysql
+    networks:
+      - evl_network
+
+  # ===================================
+  # CELERY BEAT - Scheduled Tasks
+  # ===================================
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: evl_celery_beat
+    restart: always
+    command: celery -A workers.celery_app beat --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - redis
+      - rabbitmq
+    networks:
+      - evl_network
+
+  # ===================================
+  # CELERY FLOWER - Monitoring UI
+  # ===================================
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: evl_flower
+    restart: always
+    command: celery -A workers.celery_app flower --port=5555
+    environment:
+      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
+      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - rabbitmq
+    networks:
+      - evl_network
+
+  # ===================================
+  # AI SERVICE - WhisperX (STT)
+  # ===================================
+  whisperx:
+    build:
+      context: ./ai-services/whisperx
+      dockerfile: Dockerfile
+    container_name: evl_whisperx
+    restart: always
+    command: uvicorn api:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ai-services/whisperx:/app
+      - whisperx_models:/models
+    networks:
+      - evl_network
+    # Uncomment for GPU support
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ===================================
+  # AI SERVICE - Semantic Chunker
+  # ===================================
+  semantic-chunker:
+    build:
+      context: ./ai-services/semantic-chunker
+      dockerfile: Dockerfile
+    container_name: evl_semantic_chunker
+    restart: always
+    command: uvicorn api:app --host 0.0.0.0 --port 8002
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./ai-services/semantic-chunker:/app
+    networks:
+      - evl_network
+
+  # ===================================
+  # AI SERVICE - Smart Clipper
+  # ===================================
+  smart-clipper:
+    build:
+      context: ./ai-services/smart-clipper
+      dockerfile: Dockerfile
+    container_name: evl_smart_clipper
+    restart: always
+    command: uvicorn api:app --host 0.0.0.0 --port 8003
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "8003:8003"
+    volumes:
+      - ./ai-services/smart-clipper:/app
+    networks:
+      - evl_network
+
+  # ===================================
+  # FRONTEND - Next.js (Development)
+  # ===================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: evl_frontend
+    restart: always
+    command: npm run dev
+    environment:
+      - NEXT_PUBLIC_API_URL=${API_URL}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend-api
+    networks:
+      - evl_network
+
+networks:
+  evl_network:
+    driver: bridge
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  minio_data:
+  elasticsearch_data:
+  whisperx_models:
