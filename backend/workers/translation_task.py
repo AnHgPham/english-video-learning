@@ -1,9 +1,10 @@
 """
 Translation task using Google Gemini API
-Translates English subtitles to 8 target languages and generates SRT files
+Translates English subtitles to 8 target languages and generates VTT files
 """
 import os
 import logging
+import tempfile
 from typing import Dict, List, Any
 from celery import group
 from celery.exceptions import Retry
@@ -15,10 +16,11 @@ from core.database import get_db_context
 from core.config import settings
 from models.video import Video, Subtitle, SubtitleSource
 from models.transcript import TranscriptSentence
+from services.storage import storage_service
 
 logger = logging.getLogger(__name__)
 
-# Target languages for translation
+# Target languages for translation (8 languages)
 TARGET_LANGUAGES = {
     "vi": "Vietnamese",
     "zh": "Chinese (Simplified)",
@@ -27,7 +29,7 @@ TARGET_LANGUAGES = {
     "es": "Spanish",
     "fr": "French",
     "de": "German",
-    "pt": "Portuguese"
+    "th": "Thai"
 }
 
 # Configure Gemini API
@@ -112,12 +114,12 @@ def translate_to_language(self, video_id: int, language_code: str, language_name
             language_code=language_code
         )
 
-        # Generate SRT file
-        srt_content = generate_srt_file(sentences, translated_sentences)
+        # Generate VTT file
+        vtt_content = generate_vtt_file(sentences, translated_sentences)
 
-        # Upload SRT to MinIO/S3
-        subtitle_key = f"subtitles/{video_id}/{language_code}.srt"
-        subtitle_url = upload_subtitle_to_storage(srt_content, subtitle_key)
+        # Upload VTT to MinIO/S3
+        subtitle_key = f"{video.slug}_{language_code}.vtt"
+        subtitle_url = upload_subtitle_to_storage(vtt_content, subtitle_key)
 
         # Save subtitle record to database
         with get_db_context() as db:
@@ -231,59 +233,60 @@ English sentences:
         return sentences
 
 
-def generate_srt_file(sentences: List[TranscriptSentence], translations: List[str]) -> str:
+def generate_vtt_file(sentences: List[TranscriptSentence], translations: List[str]) -> str:
     """
-    Generate SRT subtitle file from sentences and translations
+    Generate VTT subtitle file from sentences and translations
 
     Args:
         sentences: List of TranscriptSentence objects with timing info
         translations: List of translated text (same order as sentences)
 
     Returns:
-        str: SRT file content
+        str: VTT file content
 
-    SRT Format:
+    VTT Format:
+        WEBVTT
+
         1
-        00:00:00,500 --> 00:00:03,200
+        00:00:00.500 --> 00:00:03.200
         First subtitle line
 
         2
-        00:00:03,500 --> 00:00:07,800
+        00:00:03.500 --> 00:00:07.800
         Second subtitle line
     """
-    srt_lines = []
+    vtt_lines = ["WEBVTT", ""]
 
     for index, (sentence, translation) in enumerate(zip(sentences, translations), start=1):
-        # Convert timestamps to SRT format (HH:MM:SS,mmm)
-        start_time = format_srt_timestamp(sentence.start_time)
-        end_time = format_srt_timestamp(sentence.end_time)
+        # Convert timestamps to VTT format (HH:MM:SS.mmm)
+        start_time = format_vtt_timestamp(sentence.start_time)
+        end_time = format_vtt_timestamp(sentence.end_time)
 
-        # Add SRT entry
-        srt_lines.append(f"{index}")
-        srt_lines.append(f"{start_time} --> {end_time}")
-        srt_lines.append(translation)
-        srt_lines.append("")  # Empty line between entries
+        # Add VTT cue
+        vtt_lines.append(f"{index}")
+        vtt_lines.append(f"{start_time} --> {end_time}")
+        vtt_lines.append(translation)
+        vtt_lines.append("")  # Empty line between cues
 
-    return "\n".join(srt_lines)
+    return "\n".join(vtt_lines)
 
 
-def format_srt_timestamp(seconds: float) -> str:
+def format_vtt_timestamp(seconds: float) -> str:
     """
-    Convert seconds to SRT timestamp format (HH:MM:SS,mmm)
+    Convert seconds to VTT timestamp format (HH:MM:SS.mmm)
 
     Args:
         seconds: Timestamp in seconds
 
     Returns:
-        str: Formatted timestamp (e.g., "00:01:23,456")
+        str: Formatted timestamp (e.g., "00:01:23.456")
     """
-    td = timedelta(seconds=seconds)
-    hours = int(td.total_seconds() // 3600)
-    minutes = int((td.total_seconds() % 3600) // 60)
-    secs = int(td.total_seconds() % 60)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
     millis = int((seconds % 1) * 1000)
 
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
 
 def upload_subtitle_to_storage(content: str, object_key: str) -> str:
@@ -291,25 +294,40 @@ def upload_subtitle_to_storage(content: str, object_key: str) -> str:
     Upload subtitle file to MinIO/S3
 
     Args:
-        content: SRT file content
-        object_key: Storage key/path
+        content: VTT file content
+        object_key: Storage key/path (e.g., "video-slug_vi.vtt")
 
     Returns:
         str: Public URL of the uploaded subtitle
     """
-    # TODO: Implement actual MinIO/S3 upload
-    # For now, save to local file system
+    logger.info(f"Uploading subtitle to storage: {object_key}")
 
-    local_path = f"/tmp/{object_key.replace('/', '_')}"
-    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    try:
+        # Save content to temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.vtt', delete=False, encoding='utf-8') as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
 
-    with open(local_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+        # Upload to MinIO/S3
+        subtitle_url = storage_service.upload_file_from_path(
+            file_path=temp_path,
+            object_key=object_key,
+            bucket_name=settings.MINIO_BUCKET_SUBTITLES,
+            content_type="text/vtt"
+        )
 
-    logger.info(f"Subtitle saved locally: {local_path}")
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp file: {e}")
 
-    # Return mock URL (replace with actual MinIO/S3 URL in production)
-    return f"http://localhost:9000/{settings.MINIO_BUCKET_SUBTITLES}/{object_key}"
+        logger.info(f"Subtitle uploaded successfully: {subtitle_url}")
+        return subtitle_url
+
+    except Exception as e:
+        logger.error(f"Failed to upload subtitle to storage: {str(e)}")
+        raise
 
 
 @celery_app.task(bind=True, name="workers.translation_task.retranslate_subtitle", max_retries=2)
