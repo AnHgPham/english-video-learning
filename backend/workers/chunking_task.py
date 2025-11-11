@@ -4,6 +4,7 @@ Breaks transcript into meaningful sentence segments
 """
 import requests
 import logging
+import tempfile
 from typing import Dict, List, Any
 from celery.exceptions import Retry
 
@@ -11,7 +12,8 @@ from workers.celery_app import celery_app
 from core.database import get_db_context
 from core.config import settings
 from models.transcript import Transcript, TranscriptSentence
-from models.video import Video
+from models.video import Video, Subtitle, SubtitleSource
+from services.storage import storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +66,9 @@ def semantic_chunk(self, previous_result: Dict, video_id: int):
 
         logger.info(f"Semantic chunker API response received for video_id={video_id}")
 
-        # Parse and save sentence chunks
-        sentences = result.get("sentences", [])
-        sentence_count = save_sentence_chunks(transcript.id, video_id, sentences)
+        # Parse and save sentence chunks (API returns "chunks" not "sentences")
+        chunks = result.get("chunks", [])
+        sentence_count = save_sentence_chunks(transcript.id, video_id, chunks)
 
         # Mark transcript as processed
         with get_db_context() as db:
@@ -76,6 +78,10 @@ def semantic_chunk(self, previous_result: Dict, video_id: int):
                 db.commit()
 
         logger.info(f"Saved {sentence_count} sentences for video_id={video_id}")
+
+        # Regenerate VTT file from semantic sentences
+        logger.info(f"Regenerating VTT file from semantic sentences for video_id={video_id}")
+        regenerate_vtt_from_sentences(video_id, transcript.id)
 
         return {
             "status": "completed",
@@ -322,3 +328,128 @@ def merge_short_sentences(self, transcript_id: int, min_length: int = 20):
     except Exception as e:
         logger.error(f"Failed to merge short sentences for transcript_id={transcript_id}: {str(e)}")
         raise self.retry(exc=e, countdown=30)
+
+
+def regenerate_vtt_from_sentences(video_id: int, transcript_id: int):
+    """
+    Regenerate VTT file from semantic sentences instead of raw WhisperX segments
+
+    This creates better subtitles with complete sentences instead of arbitrary 3-5 second chunks.
+
+    Args:
+        video_id: ID of the video
+        transcript_id: ID of the transcript
+
+    Returns:
+        str: URL of the regenerated VTT file
+    """
+    logger.info(f"Regenerating VTT from semantic sentences for video_id={video_id}")
+
+    try:
+        with get_db_context() as db:
+            # Get video
+            video = db.query(Video).filter(Video.id == video_id).first()
+            if not video:
+                raise ValueError(f"Video {video_id} not found")
+
+            # Get sentences ordered by index
+            sentences = db.query(TranscriptSentence).filter(
+                TranscriptSentence.transcript_id == transcript_id
+            ).order_by(TranscriptSentence.sentence_index).all()
+
+            if not sentences:
+                raise ValueError(f"No sentences found for transcript_id={transcript_id}")
+
+            logger.info(f"Found {len(sentences)} sentences for VTT generation")
+
+            # Generate VTT content
+            vtt_lines = ["WEBVTT", ""]
+
+            for sentence in sentences:
+                # Format timestamps
+                start_vtt = format_vtt_timestamp(sentence.start_time)
+                end_vtt = format_vtt_timestamp(sentence.end_time)
+
+                # Add cue with sentence index
+                vtt_lines.append(f"{sentence.sentence_index + 1}")
+                vtt_lines.append(f"{start_vtt} --> {end_vtt}")
+                vtt_lines.append(sentence.text.strip())
+                vtt_lines.append("")  # Empty line between cues
+
+            vtt_content = "\n".join(vtt_lines)
+
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.vtt', delete=False, encoding='utf-8') as vtt_file:
+                vtt_file.write(vtt_content)
+                temp_vtt_path = vtt_file.name
+
+            # Upload to MinIO
+            subtitle_key = f"{video.slug}_en_semantic.vtt"
+            subtitle_url = storage_service.upload_file_from_path(
+                file_path=temp_vtt_path,
+                object_key=subtitle_key,
+                bucket_name=settings.MINIO_BUCKET_SUBTITLES,
+                content_type="text/vtt"
+            )
+
+            logger.info(f"VTT file uploaded to: {subtitle_url}")
+
+            # Update subtitle record (replace the WhisperX-generated one)
+            subtitle = db.query(Subtitle).filter(
+                Subtitle.video_id == video_id,
+                Subtitle.language == "en"
+            ).first()
+
+            if subtitle:
+                # Update existing subtitle with semantic version
+                subtitle.subtitle_url = subtitle_url
+                subtitle.subtitle_key = subtitle_key
+                subtitle.source = SubtitleSource.AI_GENERATED
+                logger.info(f"Updated subtitle record with semantic VTT")
+            else:
+                # Create new subtitle (shouldn't happen, but handle it)
+                subtitle = Subtitle(
+                    video_id=video_id,
+                    language="en",
+                    language_name="English",
+                    subtitle_url=subtitle_url,
+                    subtitle_key=subtitle_key,
+                    is_default=1,
+                    source=SubtitleSource.AI_GENERATED
+                )
+                db.add(subtitle)
+                logger.info(f"Created new subtitle record with semantic VTT")
+
+            db.commit()
+
+            # Clean up temp file
+            try:
+                import os
+                os.unlink(temp_vtt_path)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp VTT file: {e}")
+
+            logger.info(f"VTT regeneration complete for video_id={video_id}")
+            return subtitle_url
+
+    except Exception as e:
+        logger.error(f"Failed to regenerate VTT for video_id={video_id}: {str(e)}")
+        raise
+
+
+def format_vtt_timestamp(seconds: float) -> str:
+    """
+    Convert seconds to VTT timestamp format "HH:MM:SS.mmm"
+
+    Args:
+        seconds: Time in seconds (float)
+
+    Returns:
+        str: VTT formatted timestamp (e.g., "00:01:23.456")
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
