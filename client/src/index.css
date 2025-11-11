@@ -43,7 +43,8 @@
 }
 
 :root {
-  --primary: var(--color-blue-700);
+  /* Màu chính - Xanh dương cho giáo dục */
+  --primary: var(--color-blue-600);
   --primary-foreground: var(--color-blue-50);
   --sidebar-primary: var(--color-blue-600);
   --sidebar-primary-foreground: var(--color-blue-50);
@@ -59,8 +60,9 @@
   --card-foreground: oklch(0.235 0.015 65);
   --popover: oklch(1 0 0);
   --popover-foreground: oklch(0.235 0.015 65);
-  --secondary: oklch(0.98 0.001 286.375);
-  --secondary-foreground: oklch(0.4 0.015 65);
+  /* Màu phụ - Xanh lá cho accent */
+  --secondary: oklch(0.65 0.19 145);
+  --secondary-foreground: oklch(0.98 0 0);
   --muted: oklch(0.967 0.001 286.375);
   --muted-foreground: oklch(0.552 0.016 285.938);
   --accent: oklch(0.967 0.001 286.375);
