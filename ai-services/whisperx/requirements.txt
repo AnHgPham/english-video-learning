@@ -1,0 +1,21 @@
+# WhisperX Service Requirements
+
+# Core dependencies
+whisperx==3.1.1
+faster-whisper==0.10.0
+
+# API framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+
+# Audio processing
+librosa==0.10.1
+soundfile==0.12.1
+pydub==0.25.1
+
+# Utilities
+aiofiles==23.2.1
+pydantic==2.5.3
+python-dotenv==1.0.0
+requests==2.31.0
