@@ -19,6 +19,13 @@ from models.video import Video, VideoStatus, Subtitle, SubtitleSource
 from models.transcript import Transcript, TranscriptSentence
 from services.storage import storage_service
 
+# Import pipeline tasks (will be used in chain)
+# These imports happen after celery_app is initialized
+import workers.stt_task as stt_module
+import workers.chunking_task as chunking_module
+import workers.translation_task as translation_module
+import workers.indexing_task as indexing_module
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -276,12 +283,14 @@ def process_video_pipeline(self, video_id: int):
 
         # Chain the pipeline tasks
         # Each task will be executed sequentially, passing results forward
+        # NOTE: Only extract_audio is implemented. Others are TODO.
         pipeline = chain(
             extract_audio.si(video_id),
-            transcribe_audio.s(video_id),
-            semantic_chunk.s(video_id),
-            translate_subtitles.s(video_id),
-            index_transcript.s(video_id)
+            stt_module.transcribe_audio.s(video_id),
+            # TODO: Uncomment when implemented
+            # chunking_module.semantic_chunk.s(video_id),
+            # translation_module.translate_subtitles.s(video_id),
+            # indexing_module.index_transcript.s(video_id)
         )
 
         # Execute the pipeline
