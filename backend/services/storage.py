@@ -208,6 +208,115 @@ class StorageService:
         except:
             return False
 
+    def get_presigned_post_url(
+        self,
+        object_key: str,
+        bucket_name: str,
+        expires_in: int = 3600,
+        max_file_size: int = 5 * 1024 * 1024 * 1024,  # 5GB default
+        content_type: Optional[str] = None
+    ) -> dict:
+        """
+        Generate presigned POST URL for direct client-side upload
+
+        This allows clients to upload directly to storage without
+        proxying through the backend server.
+
+        Args:
+            object_key: S3 object key where file will be stored
+            bucket_name: Bucket name
+            expires_in: Expiration time in seconds (default: 1 hour)
+            max_file_size: Maximum file size in bytes (default: 5GB)
+            content_type: Optional content type restriction
+
+        Returns:
+            Dict containing:
+            - url: Upload URL
+            - fields: Form fields to include with upload
+            - expires_in: Expiration time
+        """
+        try:
+            if self.use_aws:
+                # AWS S3 presigned POST
+                conditions = [
+                    ["content-length-range", 1, max_file_size]
+                ]
+                if content_type:
+                    conditions.append(["eq", "$Content-Type", content_type])
+
+                response = self.s3_client.generate_presigned_post(
+                    Bucket=self.bucket_name,
+                    Key=object_key,
+                    ExpiresIn=expires_in,
+                    Conditions=conditions
+                )
+
+                return {
+                    "url": response["url"],
+                    "fields": response["fields"],
+                    "expires_in": expires_in
+                }
+            else:
+                # MinIO presigned PUT URL (MinIO doesn't support POST policy well)
+                # We'll use presigned PUT which works better for MinIO
+                self._ensure_bucket_exists(bucket_name)
+
+                from minio.commonconfig import ENABLED
+                from minio.sseconfig import SseCustomerKey
+
+                url = self.minio_client.presigned_put_object(
+                    bucket_name,
+                    object_key,
+                    expires=timedelta(seconds=expires_in)
+                )
+
+                return {
+                    "url": url,
+                    "method": "PUT",
+                    "fields": {},
+                    "expires_in": expires_in,
+                    "headers": {
+                        "Content-Type": content_type or "video/mp4"
+                    }
+                }
+
+        except (S3Error, ClientError) as e:
+            raise Exception(f"Failed to generate presigned POST URL: {str(e)}")
+
+    def get_file_metadata(self, object_key: str, bucket_name: str) -> dict:
+        """
+        Get file metadata from storage
+
+        Args:
+            object_key: S3 object key
+            bucket_name: Bucket name
+
+        Returns:
+            Dict with file metadata (size, content_type, etag, last_modified)
+        """
+        try:
+            if self.use_aws:
+                response = self.s3_client.head_object(
+                    Bucket=self.bucket_name,
+                    Key=object_key
+                )
+                return {
+                    "size": response.get("ContentLength"),
+                    "content_type": response.get("ContentType"),
+                    "etag": response.get("ETag", "").strip('"'),
+                    "last_modified": response.get("LastModified")
+                }
+            else:
+                stat = self.minio_client.stat_object(bucket_name, object_key)
+                return {
+                    "size": stat.size,
+                    "content_type": stat.content_type,
+                    "etag": stat.etag,
+                    "last_modified": stat.last_modified
+                }
+        except (S3Error, ClientError) as e:
+            raise Exception(f"Failed to get file metadata: {str(e)}")
+
 
 # Global storage service instance
 storage_service = StorageService()

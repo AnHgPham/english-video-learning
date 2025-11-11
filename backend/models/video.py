@@ -82,9 +82,15 @@ class Video(Base):
     video_url = Column("videoUrl", Text, nullable=False)
     video_key = Column("videoKey", String(500), nullable=False)
     thumbnail_url = Column("thumbnailUrl", Text, nullable=True)
+    thumbnail_key = Column("thumbnailKey", String(500), nullable=True)
+
+    # Audio file (extracted by pipeline)
+    audio_url = Column("audioUrl", Text, nullable=True)
+    audio_key = Column("audioKey", String(500), nullable=True)
 
     # Metadata
     duration = Column(Integer, nullable=True)  # Duration in seconds
+    resolution = Column(String(20), nullable=True)  # e.g., "1920x1080"
     level = Column(SQLEnum(VideoLevel), nullable=False)
     language = Column(String(10), default="en", nullable=False)
 
