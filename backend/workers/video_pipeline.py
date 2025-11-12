@@ -286,14 +286,13 @@ def process_video_pipeline(self, video_id: int):
         # Week 5-6: extract_audio → transcribe_audio ✅
         # Week 7: semantic_chunk ✅
         # Week 8: translate_subtitles (8 languages in parallel) ✅
-        # Week 9+: indexing (TODO)
+        # Week 15-16: index_transcript ✅
         pipeline = chain(
             extract_audio.si(video_id),
             stt_module.transcribe_audio.s(video_id),
             chunking_module.semantic_chunk.s(video_id),
             translation_module.translate_subtitles.s(video_id),
-            # TODO: Uncomment when implemented
-            # indexing_module.index_transcript.s(video_id)
+            indexing_module.index_transcript.s(video_id)
         )
 
         # Execute the pipeline

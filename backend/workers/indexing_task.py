@@ -4,6 +4,7 @@ Indexes transcript sentences for semantic search
 """
 import logging
 from typing import Dict, List, Any
+from datetime import datetime
 from celery.exceptions import Retry
 from elasticsearch import Elasticsearch, helpers
 
@@ -11,7 +12,7 @@ from workers.celery_app import celery_app
 from core.database import get_db_context
 from core.config import settings
 from models.transcript import TranscriptSentence
-from models.video import Video
+from models.video import Video, VideoStatus
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,19 @@ def index_transcript(self, previous_result: Dict, video_id: int):
 
         if failed_items:
             logger.warning(f"Failed to index {len(failed_items)} documents")
+
+        # Mark video as PUBLISHED after successful indexing
+        if success_count > 0:
+            try:
+                with get_db_context() as db:
+                    video = db.query(Video).filter(Video.id == video_id).first()
+                    if video:
+                        video.status = VideoStatus.PUBLISHED
+                        video.published_at = datetime.utcnow()
+                        db.commit()
+                        logger.info(f"Video {video_id} marked as PUBLISHED")
+            except Exception as e:
+                logger.error(f"Failed to update video status: {str(e)}")
 
         return {
             "status": "completed",
