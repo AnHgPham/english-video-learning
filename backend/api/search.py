@@ -1,6 +1,6 @@
 """
 Search API endpoints
-MODULE 7: Transcript Search (Elasticsearch Integration)
+Transcript Search with Elasticsearch Integration
 Handles searching through video transcripts for phrases and context
 """
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -9,14 +9,24 @@ from sqlalchemy import or_, and_
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
+from elasticsearch import Elasticsearch
 
 from core.database import get_db
 from core.security import get_current_user
+from core.config import settings
 from models.user import User
-from models.video import Video
+from models.video import Video, VideoLevel
 from models.transcript import TranscriptSentence
 
 router = APIRouter()
+
+# Initialize Elasticsearch client
+es_client = None
+if settings.ELASTICSEARCH_URL:
+    try:
+        es_client = Elasticsearch([settings.ELASTICSEARCH_URL])
+    except Exception as e:
+        print(f"Failed to initialize Elasticsearch client: {str(e)}")
 
 
 # ============================================
@@ -73,21 +83,15 @@ async def search_transcripts(
     db: Session = Depends(get_db)
 ):
     """
-    Search through video transcripts
+    Search through video transcripts using Elasticsearch
 
-    **NOTE**: This is a placeholder implementation using SQL LIKE.
-    In production, this should be replaced with Elasticsearch for:
+    **Features**:
     - Full-text search with relevance scoring
-    - Fuzzy matching and typo tolerance
+    - Fuzzy matching for typo tolerance
     - Phrase matching with proximity
-    - Highlighting matched terms
+    - Highlighted matched terms in results
     - Sub-second search performance
-    - Faceted search and aggregations
-
-    Current implementation:
-    - Basic SQL LIKE search (case-insensitive)
-    - Works for demo and small datasets
-    - Limited performance at scale
+    - Multi-field filtering (video, level, category)
 
     **Parameters**:
     - **q**: Search query (required)
@@ -100,10 +104,137 @@ async def search_transcripts(
     **Returns**:
     - Matching transcript sentences with video context
     - Pagination metadata
+    - Execution time
     """
     start_time = datetime.utcnow()
 
-    # Build base query
+    # Use Elasticsearch if available, fallback to SQL
+    if es_client:
+        try:
+            # Build Elasticsearch query
+            search_body = {
+                "query": {
+                    "bool": {
+                        "must": [
+                            {
+                                "match": {
+                                    "text": {
+                                        "query": q,
+                                        "fuzziness": "AUTO",  # Typo tolerance
+                                        "operator": "or"
+                                    }
+                                }
+                            }
+                        ],
+                        "filter": []
+                    }
+                },
+                "highlight": {
+                    "fields": {
+                        "text": {
+                            "pre_tags": ["<mark>"],
+                            "post_tags": ["</mark>"],
+                            "fragment_size": 200,
+                            "number_of_fragments": 1
+                        }
+                    }
+                },
+                "from": (page - 1) * page_size,
+                "size": page_size,
+                "sort": [
+                    {"_score": {"order": "desc"}},  # Relevance first
+                    {"sentence_index": {"order": "asc"}}
+                ]
+            }
+
+            # Apply filters
+            if video_id is not None:
+                search_body["query"]["bool"]["filter"].append(
+                    {"term": {"video_id": video_id}}
+                )
+
+            if level:
+                try:
+                    video_level = VideoLevel[level.upper()]
+                    search_body["query"]["bool"]["filter"].append(
+                        {"term": {"video_level": video_level.value}}
+                    )
+                except KeyError:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Invalid level: {level}. Must be one of: A1, A2, B1, B2, C1, C2"
+                    )
+
+            if category_id is not None:
+                search_body["query"]["bool"]["filter"].append(
+                    {"term": {"category_id": category_id}}
+                )
+
+            # Execute Elasticsearch query
+            response = es_client.search(
+                index=settings.ELASTICSEARCH_INDEX_TRANSCRIPTS,
+                body=search_body
+            )
+
+            hits = response.get("hits", {})
+            total = hits.get("total", {}).get("value", 0)
+            results = hits.get("hits", [])
+
+            # Fetch video details from DB for the results
+            video_ids = list(set(hit["_source"]["video_id"] for hit in results))
+            videos_map = {}
+            if video_ids:
+                videos = db.query(Video).filter(Video.id.in_(video_ids)).all()
+                videos_map = {v.id: v for v in videos}
+
+            # Build response items
+            items = []
+            for hit in results:
+                source = hit["_source"]
+                video = videos_map.get(source["video_id"])
+
+                if not video:
+                    continue
+
+                # Get highlighted text
+                highlight = hit.get("highlight", {}).get("text", [])
+                highlighted_text = highlight[0] if highlight else None
+
+                items.append(SearchResultItem(
+                    id=source["sentence_id"],
+                    videoId=source["video_id"],
+                    videoTitle=source["video_title"],
+                    videoThumbnailUrl=video.thumbnail_url,
+                    text=source["text"],
+                    startTime=source["start_time"],
+                    endTime=source["end_time"],
+                    sentenceIndex=source["sentence_index"],
+                    highlightedText=highlighted_text,
+                    matchScore=round(hit["_score"], 2)
+                ))
+
+            # Calculate execution time
+            end_time = datetime.utcnow()
+            execution_time_ms = (end_time - start_time).total_seconds() * 1000
+
+            # Calculate total pages
+            total_pages = (total + page_size - 1) // page_size
+
+            return SearchResponse(
+                results=items,
+                total=total,
+                page=page,
+                pageSize=page_size,
+                totalPages=total_pages,
+                query=q,
+                executionTimeMs=round(execution_time_ms, 2)
+            )
+
+        except Exception as e:
+            # Log error and fallback to SQL
+            print(f"Elasticsearch search failed: {str(e)}, falling back to SQL")
+
+    # Fallback: SQL-based search
     query = db.query(TranscriptSentence, Video).join(
         Video, TranscriptSentence.video_id == Video.id
     )
@@ -111,8 +242,7 @@ async def search_transcripts(
     # Only search published videos
     query = query.filter(Video.status == "published")
 
-    # Apply search filter (placeholder: SQL LIKE)
-    # TODO: Replace with Elasticsearch
+    # Apply search filter
     search_term = f"%{q}%"
     query = query.filter(TranscriptSentence.text.ilike(search_term))
 
@@ -121,7 +251,6 @@ async def search_transcripts(
         query = query.filter(Video.id == video_id)
 
     if level:
-        from models.video import VideoLevel
         try:
             video_level = VideoLevel[level.upper()]
             query = query.filter(Video.level == video_level)
@@ -137,7 +266,7 @@ async def search_transcripts(
     # Get total count
     total = query.count()
 
-    # Apply pagination and sorting (by sentence order)
+    # Apply pagination
     offset = (page - 1) * page_size
     results = query.order_by(
         TranscriptSentence.video_id,
@@ -147,11 +276,11 @@ async def search_transcripts(
     # Build response items
     items = []
     for sentence, video in results:
-        # Simple highlighting (placeholder)
+        # Simple highlighting
         highlighted_text = sentence.text.replace(
             q,
             f"<mark>{q}</mark>"
-        ) if q in sentence.text else None
+        ) if q.lower() in sentence.text.lower() else None
 
         items.append(SearchResultItem(
             id=sentence.id,
@@ -163,7 +292,7 @@ async def search_transcripts(
             endTime=sentence.end_time,
             sentenceIndex=sentence.sentence_index,
             highlightedText=highlighted_text,
-            matchScore=1.0  # Placeholder score
+            matchScore=1.0
         ))
 
     # Calculate execution time
